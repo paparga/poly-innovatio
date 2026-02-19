@@ -27,17 +27,16 @@ import {
 import {
   initClobClient,
   getWalletAddress,
-  placeDualOrders,
-  waitForFill,
+  placeOrder,
+  waitForOrderFill,
   cancelAllOrders,
-  type DualOrderResult,
 } from "./clob.js";
 import readline from "node:readline";
 
 // CLI flags
 const IS_LIVE = process.argv.includes("--live");
 const sizeIdx = process.argv.indexOf("--size");
-const POSITION_SIZE = sizeIdx !== -1 ? parseFloat(process.argv[sizeIdx + 1]) : 1;
+const POSITION_SIZE = sizeIdx !== -1 ? parseFloat(process.argv[sizeIdx + 1]) : 5;
 
 const MAX_SESSION_LOSS = 50; // halt trading if session losses exceed this
 
@@ -252,8 +251,9 @@ async function mainLive() {
     process.exit(0);
   }
 
-  // Track active orders for SIGINT cleanup
-  let activeOrders: DualOrderResult | null = null;
+  // Track active order for SIGINT cleanup
+  let activeOrderId: string | null = null;
+  let activeWs: { close: () => void } | null = null;
   let sessionPnL = 0;
   let sessionTrades = 0;
   let fillAbortController: AbortController | null = null;
@@ -267,10 +267,15 @@ async function mainLive() {
       fillAbortController.abort();
     }
 
-    // Cancel active orders
-    if (activeOrders) {
-      console.log("[Main] Cancelling active orders...");
-      await cancelAllOrders([activeOrders.upOrderId, activeOrders.downOrderId]);
+    // Cancel active order
+    if (activeOrderId) {
+      console.log("[Main] Cancelling active order...");
+      await cancelAllOrders([activeOrderId]);
+    }
+
+    // Close active WebSocket
+    if (activeWs) {
+      activeWs.close();
     }
 
     stopResolutionLoop();
@@ -287,6 +292,7 @@ async function mainLive() {
   console.log("[Main] Background resolution loop started (every 10s)");
 
   const MAX_FETCH_RETRIES = 3;
+  const BUY_MAX_PRICE = 0.85;
 
   while (true) {
     // Check session loss limit
@@ -301,9 +307,9 @@ async function mainLive() {
     const now = Date.now();
     const remaining = endTime - now;
 
-    // Need at least 15s for order placement + fill polling
-    if (remaining < 15000) {
-      console.log("[Main] Market window almost over (<15s), waiting for next...");
+    // Need at least 30s for WS signal + order placement + fill polling
+    if (remaining < 30000) {
+      console.log("[Main] Market window almost over (<30s), waiting for next...");
       await sleep(remaining + 1000);
       continue;
     }
@@ -361,65 +367,72 @@ async function mainLive() {
     console.log(`[Main] Up token:   ${market.upTokenId.slice(0, 16)}...`);
     console.log(`[Main] Down token: ${market.downTokenId.slice(0, 16)}...`);
 
-    // Place dual orders at BUY_THRESHOLD
-    const orders = await placeDualOrders(
-      market.upTokenId,
-      market.downTokenId,
-      BUY_THRESHOLD,
-      POSITION_SIZE
-    );
+    // Step 1: Connect WebSocket and wait for a side to hit threshold
+    console.log(`[Main] Waiting for WS price signal (>= $${BUY_THRESHOLD.toFixed(2)}, <= $${BUY_MAX_PRICE.toFixed(2)})...`);
 
-    if (!orders) {
-      console.log("[Main] Failed to place dual orders, skipping window...");
-      const waitTime = getMarketEndTime(slug) - Date.now();
+    const signal = await waitForPriceSignal(market, endTime);
+    activeWs = signal?.ws ?? null;
+
+    if (!signal) {
+      console.log(`[Main] No price signal this window, moving on`);
+      continue;
+    }
+
+    const { side, tokenId, price: triggerPrice, ws: marketWs } = signal;
+    console.log(`\n[Main] Signal: ${side} @ $${triggerPrice.toFixed(2)} — placing order`);
+
+    // Step 2: Place single order on the triggered side
+    const orderResult = await placeOrder(tokenId, BUY_THRESHOLD, POSITION_SIZE);
+
+    if (!orderResult) {
+      console.log("[Main] Failed to place order, skipping window...");
+      marketWs.close();
+      activeWs = null;
+      const waitTime = endTime - Date.now();
       if (waitTime > 0) await sleep(waitTime);
       continue;
     }
 
-    activeOrders = orders;
+    activeOrderId = orderResult.orderId;
 
-    // Set up abort for when market window is about to end
+    // Step 3: Poll for fill with abort at window end
     fillAbortController = new AbortController();
     const timeUntilEnd = endTime - Date.now() - 2000; // 2s safety margin
     const abortTimeout = setTimeout(() => fillAbortController!.abort(), Math.max(0, timeUntilEnd));
 
-    // Wait for fill
-    const fill = await waitForFill(
-      orders,
-      market.upTokenId,
-      market.downTokenId,
-      fillAbortController.signal
-    );
+    const fill = await waitForOrderFill(orderResult.orderId, fillAbortController.signal);
 
     clearTimeout(abortTimeout);
-    activeOrders = null;
+    activeOrderId = null;
     fillAbortController = null;
+
+    // Disconnect WS — done with this window
+    marketWs.close();
+    activeWs = null;
 
     if (fill) {
       // Record the trade
-      const tokenId = fill.filledSide === "Up" ? market.upTokenId : market.downTokenId;
       const tradeId = insertLiveTrade(
         slug,
         market.conditionId,
         tokenId,
-        fill.filledSide,
+        side,
         fill.fillPrice,
-        fill.filledOrderId,
-        fill.cancelledOrderId,
+        orderResult.orderId,
+        "",  // no cancelled counter-order
         fill.fillSize
       );
 
-      // Estimate session P&L (actual resolution happens via resolution loop)
       const estimatedCost = fill.fillPrice * fill.fillSize;
       sessionTrades++;
 
       console.log(
-        `\n>>> LIVE BUY: ${fill.filledSide} @ $${fill.fillPrice.toFixed(2)} ` +
+        `\n>>> LIVE BUY: ${side} @ $${fill.fillPrice.toFixed(2)} ` +
         `x ${fill.fillSize} = $${estimatedCost.toFixed(2)} ` +
         `(trade #${tradeId}, market: ${slug})`
       );
     } else {
-      console.log(`[Main] No fill this window, orders cancelled`);
+      console.log(`[Main] No fill this window, order cancelled`);
     }
 
     // Wait for market window to end
@@ -433,6 +446,67 @@ async function mainLive() {
   // Session ended (loss limit reached)
   stopResolutionLoop();
   closeDb();
+}
+
+/** Connect WS to market tokens, resolve when one side hits threshold. */
+function waitForPriceSignal(
+  market: MarketInfo,
+  windowEndTime: number
+): Promise<{ side: "Up" | "Down"; tokenId: string; price: number; ws: { close: () => void } } | null> {
+  const BUY_MAX_PRICE = 0.85;
+
+  return new Promise((resolve) => {
+    let resolved = false;
+
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        ws.close();
+        resolve(null);
+      }
+    }, Math.max(0, windowEndTime - Date.now() - 15000)); // 15s before end to leave time for order
+
+    const ws = connectMarketWs(
+      [market.upTokenId, market.downTokenId],
+      (tokenId, price) => {
+        if (resolved) return;
+        if (price < BUY_THRESHOLD || price > BUY_MAX_PRICE) return;
+
+        let side: "Up" | "Down";
+        if (tokenId === market.upTokenId) {
+          side = "Up";
+        } else if (tokenId === market.downTokenId) {
+          side = "Down";
+        } else {
+          return;
+        }
+
+        resolved = true;
+        clearTimeout(timeout);
+        resolve({ side, tokenId, price, ws });
+      }
+    );
+
+    // REST bootstrap: check prices immediately instead of waiting for WS
+    const checkRest = (tokenId: string, side: "Up" | "Down") =>
+      fetchWithTimeout(
+        `https://clob.polymarket.com/price?token_id=${tokenId}&side=BUY`
+      )
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (resolved || !data) return;
+          const price = parseFloat(data.price);
+          if (!isNaN(price) && price >= BUY_THRESHOLD && price <= BUY_MAX_PRICE) {
+            resolved = true;
+            clearTimeout(timeout);
+            resolve({ side, tokenId, price, ws });
+          }
+        })
+        .catch(() => {}); // REST failed, rely on WS
+
+    checkRest(market.upTokenId, "Up");
+    checkRest(market.downTokenId, "Down");
+  });
 }
 
 async function confirmLiveTrading(): Promise<boolean> {

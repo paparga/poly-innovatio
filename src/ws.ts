@@ -34,9 +34,21 @@ export function connectMarketWs(
 
     ws.on("message", (raw) => {
       try {
-        const msgs: any[] = JSON.parse(raw.toString());
+        const parsed = JSON.parse(raw.toString());
+        const msgs: any[] = Array.isArray(parsed) ? parsed : [parsed];
 
         for (const msg of msgs) {
+          // Handle price_changes wrapper: {price_changes: [{asset_id, price, best_bid, best_ask, ...}]}
+          if (Array.isArray(msg.price_changes)) {
+            for (const pc of msg.price_changes) {
+              const price = parseFloat(pc.best_bid ?? pc.price);
+              if (pc.asset_id && !isNaN(price)) {
+                onPrice(pc.asset_id, price);
+              }
+            }
+            continue;
+          }
+
           // Handle last_trade_price events
           if (msg.event_type === "last_trade_price" && msg.asset_id && msg.price) {
             const price = parseFloat(msg.price);
@@ -45,25 +57,10 @@ export function connectMarketWs(
             }
           }
 
-          // Handle price_change events
-          if (msg.event_type === "price_change" && msg.asset_id && msg.price) {
-            const price = parseFloat(msg.price);
-            if (!isNaN(price)) {
-              onPrice(msg.asset_id, price);
-            }
-          }
-
-          // Handle book snapshot — extract best prices
-          if (msg.event_type === "book" && msg.asset_id) {
-            const bestAsk = msg.asks?.[0];
+          // Handle book snapshot — extract best bid price (no event_type field in actual snapshots)
+          if (msg.asset_id && (msg.bids || msg.asks)) {
             const bestBid = msg.bids?.[0];
-            // Use midpoint or best ask as indicative price
-            if (bestAsk?.price) {
-              const price = parseFloat(bestAsk.price);
-              if (!isNaN(price)) {
-                onPrice(msg.asset_id, price);
-              }
-            } else if (bestBid?.price) {
+            if (bestBid?.price) {
               const price = parseFloat(bestBid.price);
               if (!isNaN(price)) {
                 onPrice(msg.asset_id, price);
@@ -72,7 +69,7 @@ export function connectMarketWs(
           }
         }
       } catch {
-        // Messages may not always be JSON arrays
+        // Ignore non-JSON or malformed messages
       }
     });
 
