@@ -15,8 +15,31 @@ import {
   startResolutionLoop,
   stopResolutionLoop,
   clearMarketState,
+  BUY_THRESHOLD,
 } from "./strategy.js";
-import { getTradeStats, closeDb } from "./db.js";
+import { getTradeStats, insertLiveTrade, closeDb } from "./db.js";
+import {
+  loadFilterMatrix,
+  shouldTrade,
+  getCurrentCellInfo,
+  type FilterMatrix,
+} from "./filter.js";
+import {
+  initClobClient,
+  getWalletAddress,
+  placeDualOrders,
+  waitForFill,
+  cancelAllOrders,
+  type DualOrderResult,
+} from "./clob.js";
+import readline from "node:readline";
+
+// CLI flags
+const IS_LIVE = process.argv.includes("--live");
+const sizeIdx = process.argv.indexOf("--size");
+const POSITION_SIZE = sizeIdx !== -1 ? parseFloat(process.argv[sizeIdx + 1]) : 10;
+
+const MAX_SESSION_LOSS = 50; // halt trading if session losses exceed this
 
 // --stats mode: print stats and exit
 if (process.argv.includes("--stats")) {
@@ -72,9 +95,39 @@ if (process.argv.includes("--stats")) {
   process.exit(0);
 }
 
-// Main trading loop
+// --vol and/or --backtest mode: fetch candles, compute, print, exit
+if (process.argv.includes("--vol") || process.argv.includes("--backtest")) {
+  (async () => {
+    const { fetchAllAssetCandles } = await import("./candles.js");
+    const candleData = await fetchAllAssetCandles(7);
+
+    if (candleData.size === 0) {
+      console.error("No candle data retrieved. Check network connectivity.");
+      process.exit(1);
+    }
+
+    if (process.argv.includes("--vol")) {
+      const { buildVolMatrix, printVolMatrix } = await import("./volatility.js");
+      const matrix = buildVolMatrix(candleData);
+      printVolMatrix(matrix);
+    }
+
+    if (process.argv.includes("--backtest")) {
+      const { runBacktest, printBacktestResults } = await import("./backtest.js");
+      const results = runBacktest(candleData);
+      printBacktestResults(results);
+    }
+  })()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error("Fatal error:", err);
+      process.exit(1);
+    });
+} else {
+
+// Main trading loop (paper)
 async function main() {
-  console.log("=== PolyInnovatio - BTC 5-Min Paper Trader ===\n");
+  console.log("=== PolyInnovatio - XRP 5-Min Paper Trader ===\n");
 
   // Handle graceful shutdown
   process.on("SIGINT", () => {
@@ -173,6 +226,240 @@ async function main() {
   }
 }
 
+// Live trading loop
+async function mainLive() {
+  console.log("=== PolyInnovatio - XRP 5-Min LIVE Trader ===\n");
+
+  // Init CLOB client
+  const ok = await initClobClient();
+  if (!ok) {
+    console.error("[Main] Failed to initialize CLOB client. Is PRIVATE_KEY set in .env?");
+    process.exit(1);
+  }
+
+  // Load hour/day filter matrix
+  const filterMatrix = await loadFilterMatrix();
+  if (!filterMatrix) {
+    console.error("[Main] Failed to load filter matrix, aborting live mode");
+    process.exit(1);
+  }
+
+  // Confirmation prompt
+  const confirmed = await confirmLiveTrading();
+  if (!confirmed) {
+    console.log("[Main] Live trading aborted by user");
+    closeDb();
+    process.exit(0);
+  }
+
+  // Track active orders for SIGINT cleanup
+  let activeOrders: DualOrderResult | null = null;
+  let sessionPnL = 0;
+  let sessionTrades = 0;
+  let fillAbortController: AbortController | null = null;
+
+  // Handle graceful shutdown
+  process.on("SIGINT", async () => {
+    console.log("\n\n[Main] Shutting down live trader...\n");
+
+    // Abort any active fill polling
+    if (fillAbortController) {
+      fillAbortController.abort();
+    }
+
+    // Cancel active orders
+    if (activeOrders) {
+      console.log("[Main] Cancelling active orders...");
+      await cancelAllOrders([activeOrders.upOrderId, activeOrders.downOrderId]);
+    }
+
+    stopResolutionLoop();
+    const stats = getTradeStats();
+    console.log(`Session: ${sessionTrades} trades, session P&L estimate: ${sessionPnL >= 0 ? "+" : ""}$${sessionPnL.toFixed(2)}`);
+    console.log(`All-time: ${stats.total} trades, P&L: ${stats.totalProfit >= 0 ? "+" : ""}$${stats.totalProfit.toFixed(2)}`);
+    console.log(`Run 'npm start -- --stats' for full history.\n`);
+    closeDb();
+    process.exit(0);
+  });
+
+  // Start background resolution loop
+  startResolutionLoop();
+  console.log("[Main] Background resolution loop started (every 10s)");
+
+  const MAX_FETCH_RETRIES = 3;
+
+  while (true) {
+    // Check session loss limit
+    if (sessionPnL <= -MAX_SESSION_LOSS) {
+      console.log(`\n[Main] Session loss limit reached ($${MAX_SESSION_LOSS}). Halting live trading.`);
+      console.log(`[Main] Session P&L: -$${Math.abs(sessionPnL).toFixed(2)} over ${sessionTrades} trades`);
+      break;
+    }
+
+    const slug = getCurrentMarketSlug();
+    const endTime = getMarketEndTime(slug);
+    const now = Date.now();
+    const remaining = endTime - now;
+
+    // Need at least 15s for order placement + fill polling
+    if (remaining < 15000) {
+      console.log("[Main] Market window almost over (<15s), waiting for next...");
+      await sleep(remaining + 1000);
+      continue;
+    }
+
+    // Check hour/day filter
+    const cellInfo = getCurrentCellInfo(filterMatrix);
+    if (!shouldTrade(filterMatrix)) {
+      console.log(
+        `\n[Main] Skipping window — ${cellInfo.day} ${cellInfo.hour}:00 UTC win rate: ` +
+        `${cellInfo.winRate !== null ? cellInfo.winRate.toFixed(0) + "%" : "N/A"} ` +
+        `(${cellInfo.trades} samples, below 60% threshold)`
+      );
+      await sleep(remaining + 1000);
+      continue;
+    }
+
+    console.log(
+      `\n[Main] ${cellInfo.day} ${cellInfo.hour}:00 UTC — win rate: ` +
+      `${cellInfo.winRate !== null ? cellInfo.winRate.toFixed(0) + "%" : "N/A"} ` +
+      `(${cellInfo.trades} samples) — TRADING`
+    );
+
+    console.log(`[Main] Current market: ${slug}`);
+    console.log(`[Main] Window ends in ${Math.round(remaining / 1000)}s`);
+
+    // Discover market with retry cap
+    let market: MarketInfo | "closed" | null = null;
+    let fetchRetries = 0;
+
+    while (!market) {
+      market = await fetchMarket(slug);
+
+      if (market === "closed") {
+        console.log("[Main] Market already closed/resolved, skipping to next window...");
+        const waitTime = getMarketEndTime(slug) - Date.now();
+        if (waitTime > 0) await sleep(waitTime);
+        break;
+      }
+
+      if (!market) {
+        fetchRetries++;
+        if (fetchRetries >= MAX_FETCH_RETRIES) {
+          console.log("[Main] Market not found after 3 attempts, skipping to next window...");
+          const waitTime = getMarketEndTime(slug) - Date.now();
+          if (waitTime > 0) await sleep(waitTime);
+          break;
+        }
+        console.log("[Main] Market not found, waiting 10s and retrying...");
+        await sleep(10_000);
+      }
+    }
+
+    if (!market || market === "closed") continue;
+
+    console.log(`[Main] Up token:   ${market.upTokenId.slice(0, 16)}...`);
+    console.log(`[Main] Down token: ${market.downTokenId.slice(0, 16)}...`);
+
+    // Place dual orders at BUY_THRESHOLD
+    const orders = await placeDualOrders(
+      market.upTokenId,
+      market.downTokenId,
+      BUY_THRESHOLD,
+      POSITION_SIZE
+    );
+
+    if (!orders) {
+      console.log("[Main] Failed to place dual orders, skipping window...");
+      const waitTime = getMarketEndTime(slug) - Date.now();
+      if (waitTime > 0) await sleep(waitTime);
+      continue;
+    }
+
+    activeOrders = orders;
+
+    // Set up abort for when market window is about to end
+    fillAbortController = new AbortController();
+    const timeUntilEnd = endTime - Date.now() - 2000; // 2s safety margin
+    const abortTimeout = setTimeout(() => fillAbortController!.abort(), Math.max(0, timeUntilEnd));
+
+    // Wait for fill
+    const fill = await waitForFill(
+      orders,
+      market.upTokenId,
+      market.downTokenId,
+      fillAbortController.signal
+    );
+
+    clearTimeout(abortTimeout);
+    activeOrders = null;
+    fillAbortController = null;
+
+    if (fill) {
+      // Record the trade
+      const tokenId = fill.filledSide === "Up" ? market.upTokenId : market.downTokenId;
+      const tradeId = insertLiveTrade(
+        slug,
+        market.conditionId,
+        tokenId,
+        fill.filledSide,
+        fill.fillPrice,
+        fill.filledOrderId,
+        fill.cancelledOrderId,
+        fill.fillSize
+      );
+
+      // Estimate session P&L (actual resolution happens via resolution loop)
+      const estimatedCost = fill.fillPrice * fill.fillSize;
+      sessionTrades++;
+
+      console.log(
+        `\n>>> LIVE BUY: ${fill.filledSide} @ $${fill.fillPrice.toFixed(2)} ` +
+        `x ${fill.fillSize} = $${estimatedCost.toFixed(2)} ` +
+        `(trade #${tradeId}, market: ${slug})`
+      );
+    } else {
+      console.log(`[Main] No fill this window, orders cancelled`);
+    }
+
+    // Wait for market window to end
+    const waitTime = endTime - Date.now();
+    if (waitTime > 0) await sleep(waitTime);
+
+    // Brief pause before next market
+    await sleep(2000);
+  }
+
+  // Session ended (loss limit reached)
+  stopResolutionLoop();
+  closeDb();
+}
+
+async function confirmLiveTrading(): Promise<boolean> {
+  const wallet = getWalletAddress();
+
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║           LIVE TRADING CONFIRMATION              ║");
+  console.log("╠══════════════════════════════════════════════════╣");
+  console.log(`║  Wallet:    ${wallet.slice(0, 10)}...${wallet.slice(-8)}`.padEnd(51) + "║");
+  console.log(`║  Size:      $${POSITION_SIZE} per order`.padEnd(51) + "║");
+  console.log(`║  Loss limit: $${MAX_SESSION_LOSS} per session`.padEnd(51) + "║");
+  console.log("║                                                  ║");
+  console.log("║  This will place REAL orders with REAL money!    ║");
+  console.log("╠══════════════════════════════════════════════════╣");
+  console.log("║  Type CONFIRM to proceed, anything else to abort ║");
+  console.log("╚══════════════════════════════════════════════════╝");
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  return new Promise<boolean>((resolve) => {
+    rl.question("\n> ", (answer) => {
+      rl.close();
+      resolve(answer.trim() === "CONFIRM");
+    });
+  });
+}
+
 async function fetchInitialPrices(market: MarketInfo) {
   try {
     const [upRes, downRes] = await Promise.all([
@@ -222,8 +509,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  closeDb();
-  process.exit(1);
-});
+if (IS_LIVE) {
+  mainLive().catch((err) => {
+    console.error("Fatal error:", err);
+    closeDb();
+    process.exit(1);
+  });
+} else {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    closeDb();
+    process.exit(1);
+  });
+}
+
+} // end else (--vol / --backtest guard)

@@ -16,7 +16,7 @@ export interface MarketInfo {
 export function getCurrentMarketSlug(): string {
   const nowSec = Math.floor(Date.now() / 1000);
   const ts = Math.floor(nowSec / 300) * 300;
-  return `btc-updown-5m-${ts}`;
+  return `xrp-updown-5m-${ts}`;
 }
 
 export function getMarketEndTime(slug: string): number {

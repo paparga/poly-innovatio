@@ -22,6 +22,17 @@ db.exec(`
   )
 `);
 
+// Idempotent migrations for live trading columns
+const migrations = [
+  "ALTER TABLE trades ADD COLUMN order_id TEXT",
+  "ALTER TABLE trades ADD COLUMN cancel_order_id TEXT",
+  "ALTER TABLE trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'",
+  "ALTER TABLE trades ADD COLUMN size REAL NOT NULL DEFAULT 1.0",
+];
+for (const sql of migrations) {
+  try { db.exec(sql); } catch { /* column already exists */ }
+}
+
 export interface Trade {
   id: number;
   market_slug: string;
@@ -34,6 +45,10 @@ export interface Trade {
   profit: number | null;
   created_at: string;
   resolved_at: string | null;
+  order_id: string | null;
+  cancel_order_id: string | null;
+  mode: string;
+  size: number;
 }
 
 const insertStmt = db.prepare(`
@@ -52,9 +67,30 @@ export function insertTrade(
   return result.lastInsertRowid as number;
 }
 
+const insertLiveStmt = db.prepare(`
+  INSERT INTO trades (market_slug, condition_id, token_id, side, buy_price, order_id, cancel_order_id, mode, size)
+  VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?)
+`);
+
+export function insertLiveTrade(
+  marketSlug: string,
+  conditionId: string,
+  tokenId: string,
+  side: string,
+  buyPrice: number,
+  orderId: string,
+  cancelOrderId: string,
+  size: number
+): number {
+  const result = insertLiveStmt.run(
+    marketSlug, conditionId, tokenId, side, buyPrice, orderId, cancelOrderId, size
+  );
+  return result.lastInsertRowid as number;
+}
+
 const resolveStmt = db.prepare(`
   UPDATE trades
-  SET outcome = ?, payout = ?, profit = ? - buy_price, resolved_at = datetime('now')
+  SET outcome = ?, payout = ?, profit = (? - buy_price) * size, resolved_at = datetime('now')
   WHERE id = ?
 `);
 

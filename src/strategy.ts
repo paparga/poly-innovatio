@@ -1,7 +1,7 @@
 import { insertTrade, resolveTrade, getOpenTrades } from "./db.js";
 import { checkResolution, type MarketInfo } from "./market.js";
 
-const BUY_THRESHOLD = 0.6;
+export const BUY_THRESHOLD = 0.6;
 const BUY_MAX_PRICE = 0.85; // Reject prices above this — likely a settled/settling market
 const RESOLUTION_LOOP_INTERVAL = 10_000; // 10 seconds between resolution checks
 

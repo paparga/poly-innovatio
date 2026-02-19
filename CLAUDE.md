@@ -5,9 +5,13 @@ Bitcoin 5-minute paper trading POC for Polymarket. CLI app that monitors BTC Up/
 ## Commands
 
 ```bash
-npm install          # Install dependencies
-npm start            # Run the trading loop
-npm start -- --stats # Show trade history and stats
+npm install              # Install dependencies
+npm start                # Run the trading loop (paper)
+npm start -- --stats     # Show trade history and stats
+npm start -- --vol       # Multi-asset volatility heatmap (7 days, 1m candles)
+npm start -- --backtest  # Backtest strategy across BTC, ETH, XRP, SOL
+npm start -- --live             # Live trading (requires PRIVATE_KEY in .env)
+npm start -- --live --size 25   # Live trading with custom position size ($25/order)
 ```
 
 No build step required -- `tsx` executes TypeScript directly.
@@ -16,11 +20,16 @@ No build step required -- `tsx` executes TypeScript directly.
 
 ```
 src/
-  index.ts    - Entry point, main trading loop, graceful shutdown (SIGINT)
-  market.ts   - Polymarket Gamma API: market discovery, slug generation, resolution checking
-  ws.ts       - WebSocket connection to CLOB price stream with auto-reconnect
-  strategy.ts - Trading logic: threshold check (>=0.60), bet placement, resolution polling
-  db.ts       - SQLite layer (better-sqlite3, WAL mode): trades table, stats queries
+  index.ts       - Entry point, main trading loop, graceful shutdown (SIGINT)
+  market.ts      - Polymarket Gamma API: market discovery, slug generation, resolution checking
+  ws.ts          - WebSocket connection to CLOB price stream with auto-reconnect
+  strategy.ts    - Trading logic: threshold check (>=0.60), bet placement, resolution polling
+  db.ts          - SQLite layer (better-sqlite3, WAL mode): trades table, stats queries
+  candles.ts     - Data fetching: Binance primary, Bybit fallback, 1m candle pagination
+  backtest.ts    - 5-min window aggregation, strategy simulation, result rendering
+  volatility.ts  - Volatility computation, hour×day heatmap rendering
+  filter.ts      - Hour/day win rate filter: loads BTC backtest, skips low-winrate cells
+  clob.ts        - CLOB client wrapper: dual-order placement, fill polling, cancellation
 ```
 
 **Data flow:** `index.ts` orchestrates the cycle: compute 5-min market slug → fetch market from Gamma API → subscribe to WebSocket prices → `strategy.ts` evaluates each price tick → records trades in `db.ts` → polls resolution after window ends.
@@ -58,5 +67,6 @@ src/
 ## Environment
 
 - `.env` contains `API_KEY` (reserved for future live trading)
+- `PRIVATE_KEY` — Polygon wallet private key (required for `--live` mode)
 - `trades.db` is created at project root on first run (gitignored)
 - No test framework, linter, or CI configured yet
