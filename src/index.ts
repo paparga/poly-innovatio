@@ -37,7 +37,7 @@ import readline from "node:readline";
 // CLI flags
 const IS_LIVE = process.argv.includes("--live");
 const sizeIdx = process.argv.indexOf("--size");
-const POSITION_SIZE = sizeIdx !== -1 ? parseFloat(process.argv[sizeIdx + 1]) : 10;
+const POSITION_SIZE = sizeIdx !== -1 ? parseFloat(process.argv[sizeIdx + 1]) : 1;
 
 const MAX_SESSION_LOSS = 50; // halt trading if session losses exceed this
 
