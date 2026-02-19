@@ -39,8 +39,8 @@ export async function loadFilterMatrix(): Promise<FilterMatrix | null> {
   );
 
   return {
-    winsByHourDay: btcResult.winsByHourDay,
-    tradesByHourDay: btcResult.tradesByHourDay,
+    winsByHourDay: xrpResult.winsByHourDay,
+    tradesByHourDay: xrpResult.tradesByHourDay,
   };
 }
 

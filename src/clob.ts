@@ -4,21 +4,14 @@ import { Wallet } from "@ethersproject/wallet";
 const CLOB_HOST = "https://clob.polymarket.com";
 const CHAIN_ID = 137;
 const TICK_SIZE = "0.01";
+const MIN_SHARES = 5;
 const FILL_POLL_INTERVAL = 2000; // 2s between fill checks
 const MAX_FILL_POLLS = 130;      // 2s × 130 = ~4.3 min (window is 5 min)
 
 let client: ClobClient | null = null;
 let walletAddress: string = "";
 
-export interface DualOrderResult {
-  upOrderId: string;
-  downOrderId: string;
-}
-
 export interface FillResult {
-  filledSide: "Up" | "Down";
-  filledOrderId: string;
-  cancelledOrderId: string;
   fillPrice: number;
   fillSize: number;
 }
@@ -33,15 +26,20 @@ export async function initClobClient(): Promise<boolean> {
   try {
     const wallet = new Wallet(privateKey);
     walletAddress = wallet.address;
+    const funderAddress = process.env.FUNDER_ADDRESS;
+    const sigType = funderAddress ? 1 : 0; // 1 = POLY_PROXY, 0 = EOA
 
     // First pass: create client with signer to derive API creds
-    const tempClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet);
+    const tempClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet, undefined, sigType, funderAddress);
     console.log("[CLOB] Deriving API credentials...");
     const creds = await tempClient.createOrDeriveApiKey();
 
     // Second pass: create client with signer + creds for authenticated requests
-    client = new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds);
+    client = new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, sigType, funderAddress);
     console.log(`[CLOB] Client initialized for ${walletAddress}`);
+    if (funderAddress) {
+      console.log(`[CLOB] Using funder (proxy wallet): ${funderAddress}`);
+    }
     return true;
   } catch (err) {
     console.error("[CLOB] Failed to initialize client:", err);
@@ -53,111 +51,71 @@ export function getWalletAddress(): string {
   return walletAddress;
 }
 
-export async function placeDualOrders(
-  upTokenId: string,
-  downTokenId: string,
+export async function placeOrder(
+  tokenId: string,
   price: number,
   size: number
-): Promise<DualOrderResult | null> {
+): Promise<{ orderId: string } | null> {
   if (!client) {
     console.error("[CLOB] Client not initialized");
     return null;
   }
 
   try {
-    // Place Up order
-    console.log(`[CLOB] Placing Up limit buy @ $${price.toFixed(2)}, size=${size}...`);
-    const upSigned = await client.createOrder(
-      { tokenID: upTokenId, price, size, side: Side.BUY },
-      { tickSize: TICK_SIZE }
-    );
-    const upResp = await client.postOrder(upSigned, OrderType.GTC);
+    const shares = Math.floor((size / price) * 100) / 100;
 
-    if (!upResp.orderID) {
-      console.error("[CLOB] Up order failed:", upResp);
+    if (shares < MIN_SHARES) {
+      console.error(`[CLOB] Order too small: ${shares} shares (minimum ${MIN_SHARES}). Increase --size to at least $${(MIN_SHARES * price).toFixed(2)}`);
       return null;
     }
 
-    console.log(`[CLOB] Up order placed: ${upResp.orderID}`);
-
-    // Place Down order
-    console.log(`[CLOB] Placing Down limit buy @ $${price.toFixed(2)}, size=${size}...`);
-    const downSigned = await client.createOrder(
-      { tokenID: downTokenId, price, size, side: Side.BUY },
+    console.log(`[CLOB] Placing limit buy @ $${price.toFixed(2)}, ${shares} shares ($${(shares * price).toFixed(2)})...`);
+    const signed = await client.createOrder(
+      { tokenID: tokenId, price, size: shares, side: Side.BUY },
       { tickSize: TICK_SIZE }
     );
-    const downResp = await client.postOrder(downSigned, OrderType.GTC);
+    const resp = await client.postOrder(signed, OrderType.GTC);
 
-    if (!downResp.orderID) {
-      console.error("[CLOB] Down order failed, cancelling Up order...");
-      await cancelAllOrders([upResp.orderID]);
+    if (!resp.orderID) {
+      console.error("[CLOB] Order failed:", resp);
       return null;
     }
 
-    console.log(`[CLOB] Down order placed: ${downResp.orderID}`);
-
-    return {
-      upOrderId: upResp.orderID,
-      downOrderId: downResp.orderID,
-    };
+    console.log(`[CLOB] Order placed: ${resp.orderID}`);
+    return { orderId: resp.orderID };
   } catch (err) {
-    console.error("[CLOB] Error placing dual orders:", err);
+    console.error("[CLOB] Error placing order:", err);
     return null;
   }
 }
 
-export async function waitForFill(
-  orders: DualOrderResult,
-  upTokenId: string,
-  downTokenId: string,
+export async function waitForOrderFill(
+  orderId: string,
   abortSignal?: AbortSignal
 ): Promise<FillResult | null> {
   if (!client) return null;
 
   for (let i = 0; i < MAX_FILL_POLLS; i++) {
     if (abortSignal?.aborted) {
-      console.log("[CLOB] Fill polling aborted, cancelling both orders...");
-      await cancelAllOrders([orders.upOrderId, orders.downOrderId]);
+      console.log("[CLOB] Fill polling aborted, cancelling order...");
+      await cancelAllOrders([orderId]);
       return null;
     }
 
     try {
-      const [upOrder, downOrder] = await Promise.all([
-        client.getOrder(orders.upOrderId),
-        client.getOrder(orders.downOrderId),
-      ]);
+      const order = await client.getOrder(orderId);
 
-      // Check Up fill
-      const upMatched = parseFloat(upOrder.size_matched);
-      if (!isNaN(upMatched) && upMatched > 0) {
-        console.log(`[CLOB] Up order filled! Cancelling Down order...`);
-        await cancelAllOrders([orders.downOrderId]);
+      const matched = parseFloat(order.size_matched);
+      if (!isNaN(matched) && matched > 0) {
+        console.log(`[CLOB] Order filled!`);
         return {
-          filledSide: "Up",
-          filledOrderId: orders.upOrderId,
-          cancelledOrderId: orders.downOrderId,
-          fillPrice: parseFloat(upOrder.price),
-          fillSize: upMatched,
+          fillPrice: parseFloat(order.price),
+          fillSize: matched,
         };
       }
 
-      // Check Down fill
-      const downMatched = parseFloat(downOrder.size_matched);
-      if (!isNaN(downMatched) && downMatched > 0) {
-        console.log(`[CLOB] Down order filled! Cancelling Up order...`);
-        await cancelAllOrders([orders.upOrderId]);
-        return {
-          filledSide: "Down",
-          filledOrderId: orders.downOrderId,
-          cancelledOrderId: orders.upOrderId,
-          fillPrice: parseFloat(downOrder.price),
-          fillSize: downMatched,
-        };
-      }
-
-      // Check if orders were cancelled externally
-      if (upOrder.status === "CANCELLED" && downOrder.status === "CANCELLED") {
-        console.log("[CLOB] Both orders cancelled externally");
+      if (order.status === "CANCELLED") {
+        console.log("[CLOB] Order cancelled externally");
         return null;
       }
     } catch (err) {
@@ -167,9 +125,8 @@ export async function waitForFill(
     await sleep(FILL_POLL_INTERVAL);
   }
 
-  // Timeout — cancel both
-  console.log("[CLOB] Fill polling timed out, cancelling both orders...");
-  await cancelAllOrders([orders.upOrderId, orders.downOrderId]);
+  console.log("[CLOB] Fill polling timed out, cancelling order...");
+  await cancelAllOrders([orderId]);
   return null;
 }
 

@@ -68,5 +68,6 @@ src/
 
 - `.env` contains `API_KEY` (reserved for future live trading)
 - `PRIVATE_KEY` — Polygon wallet private key (required for `--live` mode)
+- `FUNDER_ADDRESS` — Polymarket proxy wallet address (required for `--live` mode; sets `maker` on orders so the exchange uses the funded proxy wallet instead of the signer EOA)
 - `trades.db` is created at project root on first run (gitignored)
 - No test framework, linter, or CI configured yet

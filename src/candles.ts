@@ -12,7 +12,7 @@ export interface Candle {
   closeTime: number;  // Unix ms
 }
 
-export const ASSETS: Asset[] = ["BTC", "ETH", "XRP", "SOL"];
+export const ASSETS: Asset[] = ["XRP"];
 
 const ASSET_SYMBOLS: Record<Asset, string> = {
   BTC: "BTCUSDT",
