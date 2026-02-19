@@ -63,16 +63,6 @@ export function resolveTrade(id: number, outcome: "win" | "lose"): void {
   resolveStmt.run(outcome, payout, payout, id);
 }
 
-const timeoutStmt = db.prepare(`
-  UPDATE trades
-  SET outcome = 'timeout', payout = 0, profit = -buy_price, resolved_at = datetime('now')
-  WHERE id = ?
-`);
-
-export function resolveTradeTimeout(id: number): void {
-  timeoutStmt.run(id);
-}
-
 const openTradesStmt = db.prepare(`
   SELECT * FROM trades
   WHERE outcome IS NULL
@@ -98,16 +88,34 @@ export function getTradeStats(): {
   pending: number;
   timeouts: number;
   totalProfit: number;
+  avgWin: number | null;
+  avgLoss: number | null;
   trades: Trade[];
 } {
   const all = db.prepare("SELECT * FROM trades ORDER BY created_at DESC").all() as Trade[];
-  const wins = all.filter((t) => t.outcome === "win").length;
-  const losses = all.filter((t) => t.outcome === "lose").length;
+  const winTrades = all.filter((t) => t.outcome === "win");
+  const loseTrades = all.filter((t) => t.outcome === "lose");
   const pending = all.filter((t) => t.outcome === null).length;
   const timeouts = all.filter((t) => t.outcome === "timeout").length;
   const totalProfit = all.reduce((sum, t) => sum + (t.profit ?? 0), 0);
+  const avgWin = winTrades.length > 0
+    ? winTrades.reduce((sum, t) => sum + (t.profit ?? 0), 0) / winTrades.length
+    : null;
+  const avgLoss = loseTrades.length > 0
+    ? loseTrades.reduce((sum, t) => sum + (t.profit ?? 0), 0) / loseTrades.length
+    : null;
 
-  return { total: all.length, wins, losses, pending, timeouts, totalProfit, trades: all };
+  return {
+    total: all.length,
+    wins: winTrades.length,
+    losses: loseTrades.length,
+    pending,
+    timeouts,
+    totalProfit,
+    avgWin,
+    avgLoss,
+    trades: all,
+  };
 }
 
 export function closeDb(): void {

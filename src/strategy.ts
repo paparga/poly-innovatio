@@ -1,10 +1,9 @@
-import { insertTrade, resolveTrade, resolveTradeTimeout, getTradesBySlug, getOpenTrades } from "./db.js";
+import { insertTrade, resolveTrade, getOpenTrades } from "./db.js";
 import { checkResolution, type MarketInfo } from "./market.js";
 
 const BUY_THRESHOLD = 0.6;
 const BUY_MAX_PRICE = 0.85; // Reject prices above this — likely a settled/settling market
-const RESOLUTION_POLL_INTERVAL = 5_000; // 5 seconds between polls
-const RESOLUTION_MAX_RETRIES = 12; // 12 × 5s = 60s max wait
+const RESOLUTION_LOOP_INTERVAL = 10_000; // 10 seconds between resolution checks
 
 // Track which markets we've already bet on — seed from DB on import
 const bettedMarkets = new Set<string>(
@@ -14,12 +13,31 @@ const bettedMarkets = new Set<string>(
 // Current prices per token
 const prices = new Map<string, number>();
 
+// Track tokens that already logged "price too high" to avoid log spam
+const priceHighLogged = new Set<string>();
+
+// Settled detection — both sides above max means market is dead
+let marketSettled = false;
+
+// Background resolution loop handle
+let resolutionTimer: ReturnType<typeof setInterval> | null = null;
+
 export function getLatestPrices(): Map<string, number> {
   return prices;
 }
 
 export function hasBet(slug: string): boolean {
   return bettedMarkets.has(slug);
+}
+
+export function isMarketSettled(): boolean {
+  return marketSettled;
+}
+
+/** Clear per-market state when moving to a new market window. */
+export function clearMarketState(): void {
+  priceHighLogged.clear();
+  marketSettled = false;
 }
 
 export function handlePriceUpdate(
@@ -29,13 +47,29 @@ export function handlePriceUpdate(
 ): void {
   prices.set(tokenId, price);
 
+  // Check if both sides are above max — market is settled/dead
+  if (!marketSettled && !bettedMarkets.has(market.slug)) {
+    const upPrice = prices.get(market.upTokenId);
+    const downPrice = prices.get(market.downTokenId);
+    if (upPrice !== undefined && downPrice !== undefined &&
+        upPrice > BUY_MAX_PRICE && downPrice > BUY_MAX_PRICE) {
+      marketSettled = true;
+      console.log(`\n[Strategy] Both sides above max — market settled, skipping`);
+      return;
+    }
+  }
+
   // Already bet on this market
   if (bettedMarkets.has(market.slug)) return;
 
   // Check if price meets threshold but isn't suspiciously high (settled market)
   if (price < BUY_THRESHOLD) return;
   if (price > BUY_MAX_PRICE) {
-    console.log(`\n[Strategy] Skipping ${tokenId.slice(0, 8)}... @ $${price.toFixed(2)} — price too high, market likely settled`);
+    const key = `${market.slug}:${tokenId}`;
+    if (!priceHighLogged.has(key)) {
+      priceHighLogged.add(key);
+      console.log(`\n[Strategy] Skipping ${tokenId.slice(0, 8)}... @ $${price.toFixed(2)} — price too high, market likely settled`);
+    }
     return;
   }
 
@@ -64,41 +98,46 @@ export function handlePriceUpdate(
   );
 }
 
-export async function resolveMarketTrades(
-  market: Pick<MarketInfo, "slug">
-): Promise<void> {
-  const trades = getTradesBySlug(market.slug);
-  const pending = trades.filter((t) => t.outcome === null);
+/** Start the background resolution loop. Runs every 10s, resolving any open trades. */
+export function startResolutionLoop(): void {
+  if (resolutionTimer) return; // already running
 
-  if (pending.length === 0) return;
+  resolutionTimer = setInterval(async () => {
+    try {
+      const openTrades = getOpenTrades();
+      if (openTrades.length === 0) return;
 
-  console.log(`\n[Resolve] Polling resolution for ${market.slug}...`);
-
-  for (let attempt = 0; attempt < RESOLUTION_MAX_RETRIES; attempt++) {
-    const winner = await checkResolution(market.slug);
-
-    if (winner) {
-      for (const trade of pending) {
-        const outcome = trade.side === winner ? "win" : "lose";
-        resolveTrade(trade.id, outcome);
-        const profit = outcome === "win" ? 1 - trade.buy_price : -trade.buy_price;
-        console.log(
-          `[Resolve] Trade #${trade.id} (${trade.side}): ${outcome.toUpperCase()} | profit: ${profit >= 0 ? "+" : ""}$${profit.toFixed(2)}`
-        );
+      // Group by slug
+      const bySlug = new Map<string, typeof openTrades>();
+      for (const trade of openTrades) {
+        const list = bySlug.get(trade.market_slug) ?? [];
+        list.push(trade);
+        bySlug.set(trade.market_slug, list);
       }
-      return;
+
+      for (const [slug, trades] of bySlug) {
+        const winner = await checkResolution(slug);
+        if (!winner) continue;
+
+        for (const trade of trades) {
+          const outcome = trade.side === winner ? "win" : "lose";
+          resolveTrade(trade.id, outcome);
+          const profit = outcome === "win" ? 1 - trade.buy_price : -trade.buy_price;
+          console.log(
+            `\n[Resolve] Trade #${trade.id} (${trade.side}): ${outcome.toUpperCase()} | profit: ${profit >= 0 ? "+" : ""}$${profit.toFixed(2)}`
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[Resolve] Error in resolution loop:", err);
     }
-
-    await sleep(RESOLUTION_POLL_INTERVAL);
-  }
-
-  console.log(`[Resolve] Timed out waiting for resolution of ${market.slug}`);
-  for (const trade of pending) {
-    resolveTradeTimeout(trade.id);
-    console.log(`[Resolve] Trade #${trade.id} marked as timeout (loss)`);
-  }
+  }, RESOLUTION_LOOP_INTERVAL);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Stop the background resolution loop (for shutdown). */
+export function stopResolutionLoop(): void {
+  if (resolutionTimer) {
+    clearInterval(resolutionTimer);
+    resolutionTimer = null;
+  }
 }

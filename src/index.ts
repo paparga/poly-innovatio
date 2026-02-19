@@ -9,11 +9,14 @@ import {
 import { connectMarketWs } from "./ws.js";
 import {
   handlePriceUpdate,
-  resolveMarketTrades,
   getLatestPrices,
   hasBet,
+  isMarketSettled,
+  startResolutionLoop,
+  stopResolutionLoop,
+  clearMarketState,
 } from "./strategy.js";
-import { getTradeStats, getOpenTrades, closeDb } from "./db.js";
+import { getTradeStats, closeDb } from "./db.js";
 
 // --stats mode: print stats and exit
 if (process.argv.includes("--stats")) {
@@ -30,11 +33,21 @@ if (process.argv.includes("--stats")) {
   );
 
   if (stats.total > 0) {
-    const winRate =
-      stats.wins + stats.losses > 0
-        ? ((stats.wins / (stats.wins + stats.losses)) * 100).toFixed(1)
-        : "N/A";
-    console.log(`Win rate:      ${winRate}%`);
+    const resolved = stats.wins + stats.losses;
+    const winRateNum = resolved > 0 ? (stats.wins / resolved) * 100 : null;
+    console.log(`Win rate:      ${winRateNum !== null ? winRateNum.toFixed(1) + "%" : "N/A"}`);
+
+    if (stats.avgWin !== null && stats.avgLoss !== null && winRateNum !== null) {
+      const avgLossAbs = Math.abs(stats.avgLoss);
+      const breakEvenRate = (avgLossAbs / (stats.avgWin + avgLossAbs)) * 100;
+      const edge = winRateNum - breakEvenRate;
+      const sign = edge >= 0 ? "+" : "";
+
+      console.log(`Avg win:       +$${stats.avgWin.toFixed(2)}`);
+      console.log(`Avg loss:      -$${avgLossAbs.toFixed(2)}`);
+      console.log(`Break-even:    ${breakEvenRate.toFixed(1)}%`);
+      console.log(`Edge:          ${sign}${edge.toFixed(1)}pp`);
+    }
 
     console.log("\n--- Recent Trades ---\n");
     console.log(
@@ -66,6 +79,7 @@ async function main() {
   // Handle graceful shutdown
   process.on("SIGINT", () => {
     console.log("\n\nShutting down...\n");
+    stopResolutionLoop();
     const stats = getTradeStats();
     console.log(`Session summary: ${stats.total} trades, P&L: ${stats.totalProfit >= 0 ? "+" : ""}$${stats.totalProfit.toFixed(2)}`);
     console.log(`Run 'npm start -- --stats' for full history.\n`);
@@ -73,15 +87,9 @@ async function main() {
     process.exit(0);
   });
 
-  // Resolve any leftover pending trades from previous runs
-  const openTrades = getOpenTrades();
-  if (openTrades.length > 0) {
-    const slugs = [...new Set(openTrades.map((t) => t.market_slug))];
-    console.log(`[Main] Resolving ${openTrades.length} pending trade(s) from previous run...`);
-    for (const slug of slugs) {
-      await resolveMarketTrades({ slug });
-    }
-  }
+  // Start background resolution loop — picks up pending trades from previous runs too
+  startResolutionLoop();
+  console.log("[Main] Background resolution loop started (every 10s)");
 
   const MAX_FETCH_RETRIES = 3;
 
@@ -109,8 +117,7 @@ async function main() {
       market = await fetchMarket(slug);
 
       if (market === "closed") {
-        console.log("[Main] Market already closed/resolved, resolving pending trades...");
-        await resolveMarketTrades({ slug });
+        console.log("[Main] Market already closed/resolved, skipping to next window...");
         const waitTime = getMarketEndTime(slug) - Date.now();
         if (waitTime > 0) await sleep(waitTime);
         break;
@@ -146,19 +153,20 @@ async function main() {
       }
     );
 
-    // Wait until market window ends
-    const waitTime = endTime - Date.now();
-    if (waitTime > 0) {
-      await sleep(waitTime);
+    // Wait until market window ends, but skip early if market settles
+    let timeLeft = endTime - Date.now();
+    while (timeLeft > 0) {
+      await sleep(Math.min(1000, timeLeft));
+      if (isMarketSettled()) {
+        console.log(`\n[Main] Market settled early, moving to next window...`);
+        break;
+      }
+      timeLeft = endTime - Date.now();
     }
 
-    // Disconnect WS
+    // Disconnect WS and clear per-market state
     ws.close();
-
-    // Resolve trades in background so we don't block the next market window
-    resolveMarketTrades(market).catch((err) =>
-      console.error(`[Main] Resolution error for ${market.slug}:`, err)
-    );
+    clearMarketState();
 
     // Brief pause before next market
     await sleep(2000);
